@@ -13,6 +13,10 @@ class Adminer {
 		return array(SERVER, $_GET["username"], get_password());
 	}
 
+    function serversConfig() {
+        return [];
+    }
+
 	function connectSsl() {
 	}
 

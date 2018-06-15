@@ -19,6 +19,13 @@ class Adminer {
 		return array(SERVER, $_GET["username"], get_password());
 	}
 
+	/** Get per-server configuration
+     * @return array array("server" => array("name" => "", "connectionOptions" => array( driver specific )))
+	*/
+    function serversConfig() {
+        return [];
+	}
+
 	/** Get SSL connection options
 	* @return array array("key" => filename, "cert" => filename, "ca" => filename) or null
 	*/

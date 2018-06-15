@@ -12,43 +12,155 @@ if (isset($_GET["mssql"])) {
 	define("DRIVER", "mssql");
 	if (extension_loaded("sqlsrv")) {
 		class Min_DB {
-			var $extension = "sqlsrv", $_link, $_result, $server_info, $affected_rows, $errno, $error;
+            var $extension = "sqlsrv", $_link, $_result, $server_info, $affected_rows, $errno, $error, $_lastQuery, $_server, $_username, $_password, $_dbName, $_reconnected;
+            var $trace = 0;
 
-			function _get_error() {
-				$this->error = "";
+            /* See /var/log/syslog */
+            function ctrc($msg) {
+                if (!$this->trace) {
+                    return;
+                }
+                syslog(LOG_INFO, $msg);
+            }
+            function warn($msg) {
+                syslog(LOG_WARNING, $msg);
+            }
+
+			function _get_error($allowReconnect = true) {
+                $this->error = "";
+                $doReconnect = false;
 				foreach (sqlsrv_errors() as $error) {
 					$this->errno = $error["code"];
-					$this->error .= "$error[message]\n";
-				}
-				$this->error = rtrim($this->error);
-			}
+                    $this->error .= 'Code '.$error['code'].', '.$error['message']."\n";
+                    /* FIXME Based on error code, mark for reconnect. */
+                    $doReconnect = true;
+                }
+                $this->error = rtrim($this->error);
 
-			function connect($server, $username, $password) {
-				$this->_link = @sqlsrv_connect(preg_replace('~:~', ',', $server), array("UID" => $username, "PWD" => $password, "CharacterSet" => "UTF-8"));
+                /* The underlying MS-ODBC connection can be in a persistently
+                 * bad state with only solution to close and reconnect.
+                 * query() will observer the failure, the reconnect, and will
+                 * retry the SQL statement */
+                if ($doReconnect && $allowReconnect) {
+                    $this->warn(__METHOD__.' reconnect on error '.$this->error);
+                    $this->reconnect();
+                }
+            }
+
+            function reconnect()
+            {
+                if ($this->_link) {
+                    sqlsrv_close($this->_link);
+                    $this->_link = null;
+                }
+                $this->_reconnected = $this->connect($this->_server, $this->_username, $this->_password);
+                return $this->_reconnected;
+            }
+
+            function connect($server, $username, $password) {
+                $firstTime = false;
+                if (empty($this->_server)) { 
+                    $firstTime = true;
+                    $this->_server = $server;
+                    $this->_username = $username;
+                    $this->_password = $password;
+                }
+
+                $serverName = preg_replace('~:~', ',', $server);
+                $connOpts = $this->connectOptions($serverName, $username, $password);
+                if ($firstTime) {
+                    $this->ctrc(__METHOD__.' SQLSRV '.$serverName.' opts '.json_encode($connOpts));
+                }
+
+				$this->_link = @sqlsrv_connect($serverName, $connOpts);
 				if ($this->_link) {
-					$info = sqlsrv_server_info($this->_link);
+                    $info = sqlsrv_server_info($this->_link);
+                    if ($firstTime) {
+                        $this->ctrc(__METHOD__.' SQLSRV info '.json_encode($info));
+                    }
 					$this->server_info = $info['SQLServerVersion'];
 				} else {
-					$this->_get_error();
+					$this->_get_error(false);
 				}
 				return (bool) $this->_link;
-			}
+            }
+
+            protected function connectOptions($serverName, $username, $password)
+            {
+                global $adminer;
+                $servers = $adminer->serversConfig();
+
+                $connOpts = array(
+                    "UID" => $username,
+                    "PWD" => $password,
+                    "CharacterSet" => "UTF-8",
+                );
+                if (!empty($servers[$serverName])) {
+                    $sc = $servers[$serverName];
+                    if (!empty($sc['connectionOptions'])) {
+                        foreach ($sc['connectionOptions'] as $opt => $val) {
+                            /* Add new option or override */
+                            $connOpts[$opt] = $val;
+                        }
+                    }
+                }
+
+                /* On reconnect, use last connected database not one in cfg */
+                if (!empty($this->_dbName_)) {
+                    $connOpts['Database'] = $this->_dbName;
+                }
+
+                return $connOpts;
+            }
 
 			function quote($string) {
 				return "'" . str_replace("'", "''", $string) . "'";
 			}
 
-			function select_db($database) {
+            function select_db($database) {
+                $this->_dbName = $database;
 				return $this->query("USE " . idf_escape($database));
 			}
 
-			function query($query, $unbuffered = false) {
-				$result = sqlsrv_query($this->_link, $query); //! , array(), ($unbuffered ? array() : array("Scrollable" => "keyset"))
+            /* Perform SQL query. On error and connection re-established retry
+             */
+            function query($query, $unbuffered = false) {
+                $this->_reconnected = false;
+                $rc = $this->queryImpl($query, $unbuffered);
+                if ($this->_reconnected) {
+                    $rc = $this->queryImpl($query, $unbuffered);
+                }
+
+                return $rc;
+            }
+
+            function queryImpl($query, $unbuffered = false) {
+                $t0 = microtime(true);
+                $result = false;
+                $query = str_replace("\n", ' ', $query);
+
+                if (strncasecmp($query, 'EXEC', 4) == 0) {
+                    $opts = array();
+                    //$opts = array('Scrollable' => SQLSRV_CURSOR_KEYSET);
+                    $stmt = sqlsrv_prepare($this->_link, $query, array(), $opts);
+                    if ($stmt && sqlsrv_execute($stmt)) {
+                        $result = $stmt;
+                    }
+                } else {
+                    $result = sqlsrv_query($this->_link, $query); //! , array(), ($unbuffered ? array() : array("Scrollable" => "keyset"))
+                }
+
 				$this->error = "";
 				if (!$result) {
-					$this->_get_error();
+                    $this->_get_error();
+                    if (strlen($this->error)) {
+                        $this->warn(__METHOD__.' SQLSRV error '.$query.' '.$this->error);
+                    }
 					return false;
-				}
+                }
+
+                $latency = microtime(true) - $t0;
+                $this->ctrc(__METHOD__.' SQLSRV '.$query.'; in '.$latency.' sec');
 				return $this->store_result($result);
 			}
 
@@ -57,8 +169,11 @@ if (isset($_GET["mssql"])) {
 				$this->error = "";
 				if (!$this->_result) {
 					$this->_get_error();
+                    if (strlen($this->error)) {
+                        $this->warn(__METHOD__.' SQLSRV error '.$query.' '.$this->error);
+                    }
 					return false;
-				}
+                }
 				return true;
 			}
 
@@ -70,7 +185,11 @@ if (isset($_GET["mssql"])) {
 					return false;
 				}
 				if (sqlsrv_field_metadata($result)) {
-					return new Min_Result($result);
+                    if (is_object($this->_lastQuery)) {
+                        $this->_lastQuery->cancel();
+                    }
+                    $this->_lastQuery = new Min_Result($result);
+                    return $this->_lastQuery;
 				}
 				$this->affected_rows = sqlsrv_rows_affected($result);
 				return true;
@@ -134,8 +253,14 @@ if (isset($_GET["mssql"])) {
 				}
 			}
 
-			function __destruct() {
-				sqlsrv_free_stmt($this->_result);
+			function cancel() {
+                if ($this->_result) {
+                    sqlsrv_cancel($this->_result);
+                }
+			}
+
+            function __destruct() {
+                sqlsrv_free_stmt($this->_result);
 			}
 		}
 
@@ -143,8 +268,10 @@ if (isset($_GET["mssql"])) {
 		class Min_DB {
 			var $extension = "MSSQL", $_link, $_result, $server_info, $affected_rows, $error;
 
-			function connect($server, $username, $password) {
-				$this->_link = @mssql_connect($server, $username, $password);
+            function connect($server, $username, $password) {
+                $connOpts = $this->connectOptions($server, $username, $password);
+
+				$this->_link = @mssql_connect($server, $username, $password, $connOpts);
 				if ($this->_link) {
 					$result = $this->query("SELECT SERVERPROPERTY('ProductLevel'), SERVERPROPERTY('Edition')");
 					if ($result) {
@@ -241,7 +368,14 @@ if (isset($_GET["mssql"])) {
 			var $extension = "PDO_DBLIB";
 
 			function connect($server, $username, $password) {
-				$this->dsn("dblib:charset=utf8;host=" . str_replace(":", ";unix_socket=", preg_replace('~:(\d)~', ';port=\1', $server)), $username, $password);
+                $connOpts = $this->connectOptions($server, $username, $password);
+
+                $secureOpt = '';
+                if (!empty($connOpts['Encrypt'])) {
+                    $secureOpt = ';Encrypt=1;TrustServerCertificate=1';
+                }
+
+				$this->dsn("dblib:charset=utf8;host=" . str_replace(":", ";unix_socket=", preg_replace('~:(\d)~', ';port=\1', $server)) . $secureOpt, $username, $password);
 				return true;
 			}
 
@@ -524,7 +658,7 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 
 	function foreign_keys($table) {
 		$return = array();
-		foreach (get_rows("EXEC sp_fkeys @fktable_name = " . q($table)) as $row) {
+        foreach (get_rows("EXEC sp_fkeys @fktable_name = " . q($table)) as $row) {
 			$foreign_key = &$return[$row["FK_NAME"]];
 			$foreign_key["table"] = $row["PKTABLE_NAME"];
 			$foreign_key["source"][] = $row["FKCOLUMN_NAME"];

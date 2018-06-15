@@ -70,6 +70,12 @@ if (isset($_GET["mssql"])) {
                 $connOpts = $this->connectOptions($serverName, $username, $password);
                 if ($firstTime) {
                     $this->ctrc(__METHOD__.' SQLSRV '.$serverName.' opts '.json_encode($connOpts));
+                    if (empty($connOpts['Encrypt'])) {
+                        /* Non-SSL is ok, but all of the DB connections we 
+                         * care about require SSL and we should not see this
+                         * message in /var/log/syslog */
+                        $this->warn(__METHOD__.' _NOT_ SSL encrypted to '.$server);
+                    }
                 }
 
 				$this->_link = @sqlsrv_connect($serverName, $connOpts);
